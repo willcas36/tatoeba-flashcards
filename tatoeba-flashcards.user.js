@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      4.81
+// @version      4.82
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://tatoeba.org/img/tatoeba.svg?1781334885
 // @match        https://tatoeba.org/*/sentences/search*
-// @homepageURL  https://github.com/Will-cast/tatoeba-flashcards
-// @updateURL    https://raw.githubusercontent.com/Will-cast/tatoeba-flashcards/main/tatoeba-flashcards.user.js
-// @downloadURL  https://raw.githubusercontent.com/Will-cast/tatoeba-flashcards/main/tatoeba-flashcards.user.js
+// @homepageURL  https://github.com/willcas36/tatoeba-flashcards
+// @updateURL    https://raw.githubusercontent.com/willcas36/tatoeba-flashcards/main/tatoeba-flashcards.user.js
+// @downloadURL  https://raw.githubusercontent.com/willcas36/tatoeba-flashcards/main/tatoeba-flashcards.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '4.81';
+  const SCRIPT_VERSION = '4.82';
   const GH_TOKEN = '';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
