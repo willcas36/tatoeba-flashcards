@@ -18,19 +18,49 @@ if [ ${#scripts[@]} -eq 0 ]; then
   exit 1
 fi
 
+# Pure-bash arrow-key picker (no dependency). Menu -> stderr, chosen value -> stdout.
+arrow_pick() {
+  local options=("$@") sel=0 key
+  printf '\e[?25l' >&2 # hide cursor
+  while true; do
+    local i
+    for i in "${!options[@]}"; do
+      if [ "$i" -eq "$sel" ]; then
+        printf '\e[7m  %s  \e[0m\n' "${options[$i]}" >&2 # highlighted row
+      else
+        printf '    %s\n' "${options[$i]}" >&2
+      fi
+    done
+    IFS= read -rsn1 key
+    if [ "$key" = $'\e' ]; then
+      read -rsn2 -t 1 key # entero: bash 3.2 (macOS) no acepta timeouts fraccionales
+      case "$key" in
+        '[A') ((sel > 0)) && ((sel--)) ;;                        # up
+        '[B') ((sel < ${#options[@]} - 1)) && ((sel++)) ;;       # down
+      esac
+    elif [ -z "$key" ]; then
+      break # Enter
+    fi
+    printf '\e[%dA' "${#options[@]}" >&2 # cursor back up to redraw in place
+  done
+  printf '\e[?25h' >&2 # show cursor
+  printf '%s\n' "${options[$sel]}"
+}
+
 NAME="${1:-}"
 
-# No argument -> interactive picker.
+# No argument -> interactive picker (fzf if installed, else arrow-key bash picker).
 if [ -z "$NAME" ]; then
-  echo "Which script do you want to publish?"
-  PS3="#? "
-  select choice in "${scripts[@]}"; do
-    if [ -n "$choice" ]; then
-      NAME="$choice"
-      break
-    fi
-    echo "Invalid choice — pick a number from the list."
-  done
+  echo "Pick a script to publish (↑/↓ + Enter):" >&2
+  if command -v fzf >/dev/null 2>&1; then
+    NAME="$(printf '%s\n' "${scripts[@]}" | fzf --height=~40% --prompt='publish > ')"
+  else
+    NAME="$(arrow_pick "${scripts[@]}")"
+  fi
+  [ -z "$NAME" ] && {
+    echo "Cancelled."
+    exit 1
+  }
 fi
 
 FILE="$DIR/$NAME/$NAME.user.js"
