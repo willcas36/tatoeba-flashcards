@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      4.86
+// @version      4.87
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
-// @icon         https://tatoeba.org/img/tatoeba.svg?1781334885
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
 // @homepageURL  https://github.com/willcas36/userscripts/tree/main/tatoeba-flashcards
 // @updateURL    https://raw.githubusercontent.com/willcas36/userscripts/main/tatoeba-flashcards/tatoeba-flashcards.user.js
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '4.86';
+  const SCRIPT_VERSION = '4.87';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
