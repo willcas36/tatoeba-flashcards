@@ -65,9 +65,24 @@ fi
 
 FILE="$DIR/$NAME/$NAME.user.js"
 if [ ! -f "$FILE" ]; then
-  echo "Not found: $FILE"
-  printf '  - %s\n' "${scripts[@]}"
-  exit 1
+  # Exact folder not found -> try to resolve NAME as a unique substring (e.g. "youtube").
+  matches=()
+  for s in "${scripts[@]}"; do
+    case "$s" in *"$NAME"*) matches+=("$s") ;; esac
+  done
+  if [ ${#matches[@]} -eq 1 ]; then
+    NAME="${matches[0]}"
+    FILE="$DIR/$NAME/$NAME.user.js"
+    echo "Matched '$NAME'" >&2
+  elif [ ${#matches[@]} -gt 1 ]; then
+    echo "Ambiguous '$NAME' — matches more than one:" >&2
+    printf '  - %s\n' "${matches[@]}" >&2
+    exit 1
+  else
+    echo "No script matches '$NAME'. Available:" >&2
+    printf '  - %s\n' "${scripts[@]}" >&2
+    exit 1
+  fi
 fi
 
 # Push as the personal account (two gh accounts live on this machine).
