@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.00
+// @version      5.05
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.00';
+  const SCRIPT_VERSION = '5.05';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -69,7 +69,16 @@
   const ghToken = () => LS.get('sm-fc-gh-token') || ''; // token guardado por la UI, local a cada dispositivo (nunca en el repo público)
   let suppressPush = false,
     pushTimer = null;
-  function ghReq(method, path, body) {
+  // Cola de ESCRITURAS al gist: las corre en serie para que dos PATCH no se pisen (un gist es un repo
+  // git; PATCH concurrentes -> commit con base vieja -> 409 Conflict). Todo PATCH/POST pasa por acá.
+  let gistWriteChain = Promise.resolve();
+  function gistWrite(fn) {
+    const run = gistWriteChain.then(fn, fn); // encadena aunque el anterior haya fallado
+    gistWriteChain = run.catch(() => {}); // la cadena nunca queda rechazada
+    return run;
+  }
+  function ghReq(method, path, body, _try) {
+    _try = _try || 0;
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function')
         return reject(new Error('sin GM_xmlhttpRequest'));
@@ -91,9 +100,15 @@
         onload: (r) => {
           try {
             const j = r.responseText ? JSON.parse(r.responseText) : {};
-            r.status >= 200 && r.status < 300
-              ? resolve(j)
-              : reject(new Error('GitHub ' + r.status));
+            if (r.status >= 200 && r.status < 300) return resolve(j);
+            if (r.status === 409 && _try < 2) {
+              // conflicto (otra escritura se cruzó): reintentá con backoff
+              return setTimeout(
+                () => ghReq(method, path, body, _try + 1).then(resolve, reject),
+                500 + _try * 500,
+              );
+            }
+            reject(new Error('GitHub ' + r.status));
           } catch (e) {
             reject(e);
           }
@@ -123,13 +138,15 @@
     });
     const files = { [SYNC_FILE]: { content: JSON.stringify(payload) } };
     const id = await gistFindId();
-    const res = id
-      ? await ghReq('PATCH', '/gists/' + id, { files })
-      : await ghReq('POST', '/gists', {
-          description: 'Tatoeba Flashcards config',
-          public: false,
-          files,
-        });
+    const res = await gistWrite(() =>
+      id
+        ? ghReq('PATCH', '/gists/' + id, { files })
+        : ghReq('POST', '/gists', {
+            description: 'Tatoeba Flashcards config',
+            public: false,
+            files,
+          }),
+    );
     if (res && res.id) LS.set('sm-fc-gist-id', res.id);
     LS.set('sm-fc-sync-ts', String(payload.updated)); // no está en SYNC_KEYS -> no re-dispara push
   }
@@ -167,7 +184,7 @@
     clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
       gistPush()
-        .then(() => toast('Config sincronizada ☁︎', true))
+        .then(() => toast('Config sincronizada', true))
         .catch((e) => toast('Sync falló: ' + e.message, false));
     }, 1500);
   }
@@ -247,7 +264,7 @@
         }),
       };
     }
-    await ghReq('PATCH', '/gists/' + id, { files });
+    await gistWrite(() => ghReq('PATCH', '/gists/' + id, { files }));
   }
   function gistPushCacheDebounced(listId) {
     if (!ghToken()) return;
@@ -353,7 +370,7 @@
         }),
       },
     };
-    await ghReq('PATCH', '/gists/' + id, { files });
+    await gistWrite(() => ghReq('PATCH', '/gists/' + id, { files }));
   }
   async function gistPullSeen() {
     if (!ghToken()) return;
@@ -607,17 +624,16 @@
     toastEl.className = 'show loading';
   }
   // Resultado: el spinner se transforma en check/x dibujado y el fondo hace fade; arranca el auto-cierre.
-  function toastResult(message, ok) {
-    if (!toastEl) return;
-    toastBody(ok ? TOAST_ICONS.check : TOAST_ICONS.x, message);
-    toastEl.className = ok ? 'show ok' : 'show err';
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
-  }
-  // Toast simple (sin icono) para el resto de mensajes.
+  // Todos los toasts: icono dibujado (check si ok, x si error) + fade de fondo + auto-cierre.
   function toast(message, ok) {
     if (!toastEl) return;
-    toastEl.textContent = message;
+    // ¿viene de un spinner (toastLoading)? -> es un MORPH: swap en el lugar, sin re-deslizar.
+    const morphing = toastEl.classList.contains('loading');
+    toastBody(ok ? TOAST_ICONS.check : TOAST_ICONS.x, message);
+    if (!morphing) {
+      toastEl.classList.remove('show'); // reset...
+      void toastEl.offsetWidth; // ...+ reflow -> re-dispara la animación de entrada (deslizar + fade)
+    }
     toastEl.className = ok ? 'show ok' : 'show err';
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
@@ -892,7 +908,7 @@
     // Mínimo de 400ms para que la animación spinner -> check siempre se vea (sin parpadeo).
     if (elapsed < 400)
       await new Promise((r) => setTimeout(r, 400 - elapsed));
-    toastResult(ok ? `Oración ${msg}` : 'No se pudo (¿logueado?)', ok);
+    toast(ok ? `Oración ${msg}` : 'No se pudo (¿logueado?)', ok);
     return ok;
   }
   const addCurrent = () => {
@@ -1717,7 +1733,7 @@
       listTotal = Math.max(0, listTotal - ok);
       applyListTitle();
     } // truco local: -N sin re-fetch
-    toast(`✓ ${ok} quitada(s)`, ok > 0);
+    toast(`${ok} quitada(s)`, ok > 0); // el check lo pone el icono
     bar.querySelector('.lb-all').checked = false;
     bar.querySelector('.lb-all').indeterminate = false;
     refreshBulk(area, bar);
@@ -2570,11 +2586,13 @@
       applyDesktopPref(m, true); // modo ordenador: local, persiste
       applyControls(m, true); // controles: persistir + sincronizar
       setActiveProfile(name);
-      saveActive(); // ...y guarda globals en el perfil activo (persiste + SINCRONIZA)
+      if (ghToken())
+        toastLoading('Sincronizando…'); // spinner -> el push lo morphea a "Config sincronizada"
+      else toast('Guardado', true); // sin token (no hay sync): feedback inmediato
+      saveActive(); // ...y guarda globals en el perfil activo (persiste + dispara el push -> morph del spinner)
       closePanels();
       listUrls = [];
       resetDeck();
-      toast(`"${name}" guardado y sincronizado ☁︎`, true);
     });
     m.querySelector('#prof-rename').addEventListener('click', async () => {
       const old = profSel.value;
@@ -2638,10 +2656,10 @@
         }
         LS.set('sm-fc-gh-token', tok); // clave local-only: no está en SYNC_KEYS
       }
-      toast('Sincronizando…', true);
+      toastLoading('Sincronizando…');
       try {
         if (await gistPull()) {
-          toast('Config remota más nueva — recargando…', true);
+          toastLoading('Config remota más nueva — recargando…');
           setTimeout(() => location.reload(), 800);
           return;
         }
@@ -2650,7 +2668,7 @@
         await gistPushCacheAll(); // ...y subí el merge (un archivo por lista)
         await gistPullSeen(); // mezclá el registro de vistas...
         await gistPushSeen(); // ...y subilo
-        toast('Sincronizado ✓', true);
+        toast('Sincronizado', true); // el check lo pone el icono
       } catch (e) {
         toast('Error de sync: ' + e.message, false);
       }
@@ -2927,7 +2945,7 @@
     gistPull()
       .then((changed) => {
         if (changed) {
-          toast('Config remota más nueva — recargando…', true);
+          toastLoading('Config remota más nueva — recargando…');
           setTimeout(() => location.reload(), 700);
           return;
         }
