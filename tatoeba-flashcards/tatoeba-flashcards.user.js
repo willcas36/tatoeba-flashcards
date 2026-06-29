@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      4.87
+// @version      4.90
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '4.87';
+  const SCRIPT_VERSION = '4.90';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -372,6 +372,32 @@
 
   // Toast INTEGRADO (no depende del script de notificaciones), animado y con tema.
   let toastEl, toastTimer;
+  const TOAST_ICONS = {
+    check:
+      '<svg class="fc-toast-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M7 12.4l3.4 3.4L17 8.6"/></svg>',
+    x: '<svg class="fc-toast-x" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8.4 8.4l7.2 7.2M15.6 8.4l-7.2 7.2"/></svg>',
+  };
+  function toastBody(iconHtml, message) {
+    // icono SVG controlado + texto por textContent (seguro)
+    toastEl.innerHTML = iconHtml + '<span class="fc-toast-txt"></span>';
+    toastEl.querySelector('.fc-toast-txt').textContent = message;
+  }
+  // Loader: spinner girando, sin auto-cierre (la operación sigue en curso).
+  function toastLoading(message) {
+    if (!toastEl) return;
+    clearTimeout(toastTimer);
+    toastBody('<span class="fc-toast-spin"></span>', message);
+    toastEl.className = 'show loading';
+  }
+  // Resultado: el spinner se transforma en check/x dibujado y el fondo hace fade; arranca el auto-cierre.
+  function toastResult(message, ok) {
+    if (!toastEl) return;
+    toastBody(ok ? TOAST_ICONS.check : TOAST_ICONS.x, message);
+    toastEl.className = ok ? 'show ok' : 'show err';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
+  }
+  // Toast simple (sin icono) para el resto de mensajes.
   function toast(message, ok) {
     if (!toastEl) return;
     toastEl.textContent = message;
@@ -633,34 +659,31 @@
     }
   }
   async function listById(endpoint, id, msg) {
-    // alta/baja individual con toast
+    // El loader ya está visible (toastLoading). Acá lo cerramos transformándolo en el resultado.
+    const started = performance.now();
     const ok = await listAction(endpoint, id);
-    toast(ok ? `✓ Oración ${id} ${msg}` : 'No se pudo (¿logueado?)', ok);
+    const elapsed = performance.now() - started;
+    // Mínimo de 400ms para que la animación spinner -> check siempre se vea (sin parpadeo).
+    if (elapsed < 400)
+      await new Promise((r) => setTimeout(r, 400 - elapsed));
+    toastResult(ok ? `Oración ${msg}` : 'No se pudo (¿logueado?)', ok);
     return ok;
   }
   const addCurrent = () => {
     const c = currentCard();
-    if (c)
-      listById(
-        'add_sentence_to_list',
-        c.id,
-        'agregada',
-        'Error al agregar',
-      ).then((ok) => {
-        if (ok) syncListAdd(c);
-      });
+    if (!c) return;
+    toastLoading('Agregando oración');
+    listById('add_sentence_to_list', c.id, 'agregada').then((ok) => {
+      if (ok) syncListAdd(c);
+    });
   };
   const removeCurrent = () => {
     const c = currentCard();
-    if (c)
-      listById(
-        'remove_sentence_from_list',
-        c.id,
-        'quitada',
-        'Error al quitar',
-      ).then((ok) => {
-        if (ok) listRemoveRow(c.id);
-      });
+    if (!c) return;
+    toastLoading('Quitando oración');
+    listById('remove_sentence_from_list', c.id, 'quitada').then((ok) => {
+      if (ok) listRemoveRow(c.id);
+    });
   };
 
   /* ============ ESTILOS ============ */
@@ -727,11 +750,21 @@
       #fc-toast { position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom,0px) + 78px);
         transform:translateX(-50%) translateY(16px); z-index:2147483700; padding:10px 18px; border-radius:22px;
         font-size:14px; color:#fff; box-shadow:0 4px 16px rgba(0,0,0,.35); opacity:0; pointer-events:none;
-        max-width:86vw; text-align:center; transition:opacity .25s ease, transform .25s ease, left .25s ease; }
+        max-width:86vw; text-align:center; display:flex; align-items:center; justify-content:center; gap:9px;
+        transition:opacity .25s ease, transform .25s ease, left .25s ease, background-color .3s ease; }
       .fc-push #fc-toast { left:calc(50% - min(88vw,380px) / 2); }   /* centrado sobre el contenido (el toast vive en body) */
       #fc-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+      #fc-toast.loading { background:#3a3a42; }
       #fc-toast.ok { background:var(--accent,#4b8b3b); }
       #fc-toast.err { background:#c62828; }
+      #fc-toast .fc-toast-txt { flex:0 1 auto; text-align:left; }
+      #fc-toast .fc-toast-spin, #fc-toast .fc-toast-check, #fc-toast .fc-toast-x { flex:0 0 auto; }
+      #fc-toast .fc-toast-spin { width:18px; height:18px; box-sizing:border-box; border:2.5px solid rgba(255,255,255,.35); border-top-color:#fff; border-radius:50%; animation:fc-spin-rot .6s linear infinite; }
+      #fc-toast .fc-toast-check, #fc-toast .fc-toast-x { width:18px; height:18px; display:block; }
+      #fc-toast .fc-toast-check circle, #fc-toast .fc-toast-x circle { fill:none; stroke:rgba(255,255,255,.85); stroke-width:2; stroke-dasharray:63; stroke-dashoffset:63; animation:fc-toast-draw .35s ease forwards; }
+      #fc-toast .fc-toast-check path { fill:none; stroke:#fff; stroke-width:2.6; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:20; stroke-dashoffset:20; animation:fc-toast-draw .25s .26s ease forwards; }
+      #fc-toast .fc-toast-x path { fill:none; stroke:#fff; stroke-width:2.6; stroke-linecap:round; stroke-dasharray:30; stroke-dashoffset:30; animation:fc-toast-draw .22s .26s ease forwards; }
+      @keyframes fc-toast-draw { to { stroke-dashoffset:0; } }
       #fc-launcher { position:fixed; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 16px); z-index:2147483000;
         width:52px; height:52px; border:none; border-radius:50%; background:#4b8b3b; color:#fff;
         box-shadow:0 3px 10px rgba(0,0,0,.3); cursor:pointer; display:none; align-items:center; justify-content:center; }
