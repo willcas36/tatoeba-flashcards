@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.09
+// @version      5.10
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.09';
+  const SCRIPT_VERSION = '5.10';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -423,6 +423,69 @@
       if (!merged[sid] || remote[sid] > merged[sid]) merged[sid] = remote[sid]; // gana el ts más nuevo
     }
     saveSeen(pruneSeen(merged));
+  }
+
+  /* ===== LÍMITE CONOCIDO: truncación de 1 MB en gist =====
+     GitHub trunca el `content` de cualquier archivo de gist que pase 1 MB (manda `truncated:true`
+     + `raw_url`). Hoy NO manejamos ese caso: si un archivo (vistas o una lista) supera 1 MB,
+     su `JSON.parse` falla y el SYNC DE ESE ARCHIVO se rompe en silencio. Lo mitigamos con
+     VISIBILIDAD (indicador de tamaño en config, verde/amarillo/rojo) en vez de manejar la
+     truncación (requeriría @connect a gist.githubusercontent.com + código no testeable).
+     Si algún día se vuelve real: bajar por raw_url cuando file.truncated. */
+  const ONE_MB = 1048576;
+  const byteLen = (s) => new TextEncoder().encode(s).length;
+  function fmtSize(b) {
+    return b >= ONE_MB
+      ? (b / ONE_MB).toFixed(2) + ' MB'
+      : Math.max(1, Math.round(b / 1024)) + ' KB';
+  }
+  function sizeClass(b) {
+    if (b >= ONE_MB) return 'red'; // truncado: sync roto
+    if (b >= 0.7 * ONE_MB) return 'yellow'; // cerca del límite
+    return 'green';
+  }
+  // Tamaños (bytes) de cada archivo que se sube al gist, estimados desde el local (lo que se pushea).
+  function syncFileSizes() {
+    const out = [];
+    const cfgData = {};
+    SYNC_KEYS.forEach((k) => {
+      const v = LS.get(k);
+      if (v != null) cfgData[k] = v;
+    });
+    out.push({
+      name: 'Config',
+      bytes: byteLen(JSON.stringify({ updated: 0, data: cfgData })),
+    });
+    out.push({
+      name: 'Vistas',
+      bytes: byteLen(JSON.stringify({ updated: 0, seen: pruneSeen(loadSeen()) })),
+    });
+    const cache = loadListCache();
+    for (const lid of Object.keys(cache)) {
+      out.push({
+        name: 'Lista ' + lid,
+        bytes: byteLen(
+          JSON.stringify({ updated: 0, listId: lid, cache: cache[lid] }),
+        ),
+      });
+    }
+    return out;
+  }
+  function renderStorageInfo(m) {
+    const box = m && m.querySelector('#fc-storage');
+    if (!box) return;
+    const rows = syncFileSizes();
+    const over = rows.some((r) => r.bytes >= ONE_MB);
+    box.innerHTML =
+      rows
+        .map(
+          (r) =>
+            `<div class="fc-store-row"><span class="lbl">${r.name}</span><span class="fc-dot ${sizeClass(r.bytes)}"></span><b>${fmtSize(r.bytes)}</b></div>`,
+        )
+        .join('') +
+      (over
+        ? `<div class="fc-store-warn">⚠️ Un archivo superó 1 MB: GitHub lo trunca y el sync de ese archivo deja de funcionar. Borrá entradas viejas de la lista o bajá los días de "vistas".</div>`
+        : '');
   }
 
   /* ============ CONFIGURACIÓN ============ */
@@ -1145,6 +1208,14 @@
       #fc-modal .fc-restore:hover { color:var(--fg); border-color:var(--accent); }
       #fc-modal .fc-sub { margin-left:14px; padding-left:12px; border-left:2px solid var(--line); display:flex; flex-direction:column; gap:6px; transition:opacity .2s ease; }
       #fc-modal .fc-sub.dim { opacity:.4; } /* Auto ON -> el manual queda inactivo */
+      #fc-storage .fc-store-row { display:flex; align-items:center; gap:8px; font-size:13px; padding:3px 0; }
+      #fc-storage .fc-store-row .lbl { flex:1; color:var(--muted); }
+      #fc-storage .fc-store-row b { font-variant-numeric:tabular-nums; }
+      #fc-storage .fc-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+      #fc-storage .fc-dot.green { background:#3fa34d; }
+      #fc-storage .fc-dot.yellow { background:#e0a000; }
+      #fc-storage .fc-dot.red { background:#d33; }
+      #fc-storage .fc-store-warn { margin-top:8px; padding:8px 10px; border-radius:6px; background:rgba(221,51,51,.14); color:#e57373; font-size:12px; line-height:1.4; }
       #fc-modal .fc-tabs { display:flex; gap:2px; padding:8px 8px 0; border-bottom:1px solid var(--line); }
       #fc-modal .fc-tabs button { flex:1; padding:9px 4px; border:none; background:transparent; color:var(--muted);
         font-size:13px; cursor:pointer; border-bottom:2px solid transparent; border-radius:6px 6px 0 0; }
@@ -2235,6 +2306,7 @@
     const rb = g('#prof-restore'); // colapsa/expande con transición
     if (rb) rb.classList.toggle('collapsed', activeProfile !== PROFILE_DEFAULT);
     updateRestoreBtn(m);
+    renderStorageInfo(m); // tamaños de los archivos del gist (verde/amarillo/rojo)
   }
   // SOLO carga la config a los globals (working copy). NO persiste: persistir = saveActive() (Guardar).
   // DESKTOP_MODE no se toca acá (es local). Defaults para campos faltantes -> nunca "se pegan" del perfil anterior.
@@ -2490,6 +2562,9 @@
         <div class="row"><input type="checkbox" id="f-desktop" ${DESKTOP_MODE ? 'checked' : ''} ${DESKTOP_AUTO ? 'disabled' : ''}><span>Modo ordenador (paneles laterales)</span></div>
         <div class="hint">Selección manual (cuando Auto está apagado). Es <b>local</b> por dispositivo, no se sincroniza. En PC: Historial y Mi lista empujan el contenido. Atajos: <b>[</b> alterna Mi lista, <b>]</b> alterna Historial.</div>
       </div>
+      <h4>Almacenamiento (sync)</h4>
+      <div id="fc-storage"></div>
+      <div class="hint">Tamaño de cada archivo que se sube al gist. <b style="color:#3fa34d">Verde</b> OK · <b style="color:#e0a000">amarillo</b> cerca del límite · <b style="color:#d33">rojo</b> pasó 1 MB. GitHub trunca archivos &gt;1 MB y el sync de ese archivo deja de funcionar.</div>
       </div>
       <div class="fc-pane" data-pane="c">
       <h4>Gestos (deslizar, mobile)</h4>
@@ -2777,6 +2852,7 @@
     if (!m) return;
     m.classList.add('open');
     populateListSelect();
+    renderStorageInfo(m); // tamaños actuales de los archivos del gist (verde/amarillo/rojo)
     // Re-sincronizar los chips de Palabras con el query realmente guardado (evita que se vacíen/desincronicen).
     const box = m.querySelector('#f-query-box'),
       input = m.querySelector('#f-query-input');
