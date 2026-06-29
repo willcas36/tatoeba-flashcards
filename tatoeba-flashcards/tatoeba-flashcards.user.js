@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      4.95
+// @version      5.00
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '4.95';
+  const SCRIPT_VERSION = '5.00';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -298,6 +298,83 @@
     saveListCache(merged);
   }
 
+  /* ===== Registro de "vistas" (sincronizado por gist, ARCHIVO APARTE) =====
+     Mapa GLOBAL {idOración: ts}. Sirve para "no mostrar vistas en los últimos X días".
+     Solo timestamps (~25 bytes/entrada). Se poda a SEEN_KEEP_MS para acotar el archivo.
+     Churn: se marca una vista cada pocos segundos -> el push al gist es ESPACIADO. */
+  const SYNC_FILE_SEEN = 'tatoeba-flashcards-seen.json';
+  const SEEN_KEY = 'sm-fc-seen';
+  const SEEN_KEEP_MS = 90 * 86400000; // 90 días: ventana máxima de poda (X se limita a 90)
+  let seenPushTimer = null,
+    seenLastPush = 0;
+
+  function loadSeen() {
+    try {
+      return JSON.parse(LS.get(SEEN_KEY) || '{}') || {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveSeen(obj) {
+    LS.set(SEEN_KEY, JSON.stringify(obj)); // local-only: no está en SYNC_KEYS
+  }
+  function pruneSeen(obj) {
+    const cut = Date.now() - SEEN_KEEP_MS;
+    for (const id of Object.keys(obj)) if (!(obj[id] >= cut)) delete obj[id];
+    return obj;
+  }
+  function seenMark(id) {
+    if (id == null) return;
+    const s = loadSeen();
+    s[String(id)] = Date.now();
+    saveSeen(s);
+    gistPushSeenDebounced(); // sube AUTO (espaciado) y además al tocar Sync
+  }
+  // Push automático espaciado: evita el storm de "un push por carta".
+  function gistPushSeenDebounced() {
+    if (!ghToken()) return;
+    clearTimeout(seenPushTimer);
+    // Si pasaron >3min desde el último push, flusheá ya; si no, esperá 45s tras la última vista.
+    const wait = Date.now() - seenLastPush > 180000 ? 0 : 45000;
+    seenPushTimer = setTimeout(() => {
+      seenLastPush = Date.now();
+      gistPushSeen().catch(() => {});
+    }, wait);
+  }
+  async function gistPushSeen() {
+    if (!ghToken()) return;
+    const id = await gistFindId();
+    if (!id) return;
+    const files = {
+      [SYNC_FILE_SEEN]: {
+        content: JSON.stringify({
+          updated: Date.now(),
+          seen: pruneSeen(loadSeen()),
+        }),
+      },
+    };
+    await ghReq('PATCH', '/gists/' + id, { files });
+  }
+  async function gistPullSeen() {
+    if (!ghToken()) return;
+    const id = await gistFindId();
+    if (!id) return;
+    const g = await ghReq('GET', '/gists/' + id);
+    const file = g.files && g.files[SYNC_FILE_SEEN];
+    if (!file || !file.content) return;
+    let remote;
+    try {
+      remote = (JSON.parse(file.content) || {}).seen || {};
+    } catch (e) {
+      return;
+    }
+    const merged = loadSeen();
+    for (const sid of Object.keys(remote)) {
+      if (!merged[sid] || remote[sid] > merged[sid]) merged[sid] = remote[sid]; // gana el ts más nuevo
+    }
+    saveSeen(pruneSeen(merged));
+  }
+
   /* ============ CONFIGURACIÓN ============ */
   let LIST_ID = LS.get('sm-fc-listid') || '174916'; // lista objetivo (editable en el modal)
 
@@ -404,6 +481,9 @@
     DESKTOP_AUTO ? detectDesktop() : LS.get('sm-fc-desktop') === '1';
   let DESKTOP_MODE = effectiveDesktop(); // PC: paneles laterales que empujan + atajos [ ]
   let START_REVEALED = LS.get('sm-fc-startrevealed') === '1'; // al navegar, mostrar la carta ya revelada (default: oculta)
+  let HIDE_LISTED = true; // mazo: ocultar oraciones ya en mi lista (default ON); applyConfig carga el valor del perfil
+  let SEEN_HIDE = true; // mazo: ocultar oraciones vistas en los últimos SEEN_DAYS días (default ON)
+  let SEEN_DAYS = 3; // ventana de "vistas recientes" (1..90); applyConfig carga el valor del perfil
   const PROFILE_DEFAULT = 'Predeterminado'; // perfil base, no se puede borrar
   let activeProfile = LS.get('sm-fc-active') || PROFILE_DEFAULT;
   let dirty = false; // hay cambios aplicados (Aplicar) pero NO guardados en el perfil (no subidos)
@@ -436,6 +516,9 @@
     audioLang: 'eng',
     listSort: '-created',
     startRevealed: false,
+    hideListed: true,
+    seenHide: true,
+    seenDays: 3,
   };
 
   const K = {
@@ -646,8 +729,13 @@
     if (data.paging && typeof data.paging.total === 'number')
       totalCount = data.paging.total;
     nextUrl = data.paging && data.paging.has_next ? data.paging.next : null;
+    const excluded = HIDE_LISTED ? listExcludeSet() : null; // ocultar las que ya están en mi lista (caché)
+    const seen = SEEN_HIDE ? loadSeen() : null; // ocultar las vistas hace < SEEN_DAYS días
+    const seenCut = Date.now() - SEEN_DAYS * 86400000;
     let added = 0;
     for (const r of data.data || []) {
+      if (excluded && excluded.has(String(r.id))) continue; // ya en mi lista -> saltar (no marca seenIds: si la quitás, vuelve a aparecer)
+      if (seen && seen[String(r.id)] >= seenCut) continue; // vista hace poco -> saltar (sin marcar seenIds)
       if (!seenIds.has(r.id)) {
         seenIds.add(r.id);
         cards.push(r);
@@ -655,6 +743,10 @@
       }
     }
     return added;
+  }
+  // ids de la lista activa según el caché (lo agregado por la app), como Set de strings.
+  function listExcludeSet() {
+    return new Set(Object.keys(loadListCache()[LIST_ID] || {}));
   }
   async function ensureBuffer(force) {
     if (!force && cards.length - 1 - index > PREFETCH_AT) return;
@@ -1334,6 +1426,7 @@
     const c = currentCard();
     if (!c || revealed) return;
     revealed = true;
+    seenMark(c.id); // "vista" = al revelar la carta (sube AUTO espaciado y en Sync)
     backEl.style.visibility = 'visible';
     backEl.classList.remove('fc-reveal');
     void backEl.offsetWidth; // reflow para re-disparar la animación
@@ -1966,6 +2059,9 @@
       listId: g('#f-listid').value.trim() || '174916',
       audioLang: g('#f-audiolang').value,
       startRevealed: g('#f-startrev').checked,
+      hideListed: g('#f-hidelisted').checked,
+      seenHide: g('#f-seenhide').checked,
+      seenDays: parseInt(g('#f-seendays').value, 10) || 3,
       // 'desktop' NO va en el perfil (es local, no se sincroniza) -> se maneja con applyDesktopPref
     };
   }
@@ -2049,6 +2145,11 @@
     setV('#d-back', DISPLAY.back);
     setV('#f-audiolang', AUDIO_LANG);
     setC('#f-startrev', START_REVEALED);
+    setC('#f-hidelisted', HIDE_LISTED);
+    setC('#f-seenhide', SEEN_HIDE);
+    setV('#f-seendays', String(SEEN_DAYS));
+    const sd = g('#f-seendays');
+    if (sd) sd.disabled = !SEEN_HIDE;
     setC('#f-desktop-auto', DESKTOP_AUTO);
     setC('#f-desktop', DESKTOP_MODE);
     const mdEl = g('#f-desktop');
@@ -2084,6 +2185,9 @@
     AUDIO_LANG = cfg.audioLang || 'eng';
     listSort = cfg.listSort || '-created';
     START_REVEALED = !!cfg.startRevealed;
+    HIDE_LISTED = cfg.hideListed !== false; // default ON (true si falta)
+    SEEN_HIDE = cfg.seenHide !== false; // default ON (true si falta)
+    SEEN_DAYS = Math.min(90, Math.max(1, parseInt(cfg.seenDays, 10) || 3)); // 1..90
   }
   const PROF_KEY = 'sm-fc-profiles';
   function loadProfiles() {
@@ -2120,6 +2224,9 @@
       audioLang: AUDIO_LANG,
       listSort,
       startRevealed: START_REVEALED,
+      hideListed: HIDE_LISTED,
+      seenHide: SEEN_HIDE,
+      seenDays: SEEN_DAYS,
     };
   }
   // Compara una config con los predeterminados, sin depender del orden de claves del nivel superior.
@@ -2132,7 +2239,10 @@
       (cfg.listId || '174916') === d.listId &&
       (cfg.audioLang || 'eng') === d.audioLang &&
       (cfg.listSort || '-created') === d.listSort &&
-      !!cfg.startRevealed === !!d.startRevealed
+      !!cfg.startRevealed === !!d.startRevealed &&
+      (cfg.hideListed !== false) === (d.hideListed !== false) &&
+      (cfg.seenHide !== false) === (d.seenHide !== false) &&
+      (parseInt(cfg.seenDays, 10) || 3) === d.seenDays
     );
   }
   // Habilita/inhabilita visualmente el botón Restaurar según si el form difiere de los defaults.
@@ -2303,6 +2413,10 @@
       <div class="hint">Idioma que se revela (la "respuesta"). El audio siempre es inglés.</div>
       <div class="row"><input type="checkbox" id="f-startrev" ${START_REVEALED ? 'checked' : ''}><span>Mostrar las cartas ya reveladas al navegar</span></div>
       <div class="hint">Por defecto aparecen ocultas (tocás para revelar). Activá esto para verlas reveladas de entrada.</div>
+      <div class="row"><input type="checkbox" id="f-hidelisted" ${HIDE_LISTED ? 'checked' : ''}><span>No mostrar oraciones que ya están en mi lista</span></div>
+      <div class="hint">Mientras estudiás, salta las que ya agregaste a tu lista (las agregadas desde la app), para ver material nuevo.</div>
+      <div class="row"><input type="checkbox" id="f-seenhide" ${SEEN_HIDE ? 'checked' : ''}><span>No mostrar las vistas en los últimos <input type="number" id="f-seendays" min="1" max="90" value="${SEEN_DAYS}" ${SEEN_HIDE ? '' : 'disabled'} style="width:54px"> días</span></div>
+      <div class="hint">Repaso espaciado: salta las que ya viste hace poco para no repetir. El historial de vistas se sincroniza (archivo aparte en el gist).</div>
       <h4>Interacción</h4>
       <div class="row"><input type="checkbox" id="f-desktop-auto" ${DESKTOP_AUTO ? 'checked' : ''}><span>Auto: detectar pantalla</span></div>
       <div class="hint">Si está activo, el modo se elige solo: pantalla chica/móvil → flotante, pantalla grande → ordenador. Este toggle es <b>global</b> (todos los perfiles) y se sincroniza.</div>
@@ -2534,6 +2648,8 @@
         await gistPush();
         await gistPullCache(); // mezclá los "agregados" remotos...
         await gistPushCacheAll(); // ...y subí el merge (un archivo por lista)
+        await gistPullSeen(); // mezclá el registro de vistas...
+        await gistPushSeen(); // ...y subilo
         toast('Sincronizado ✓', true);
       } catch (e) {
         toast('Error de sync: ' + e.message, false);
@@ -2548,6 +2664,12 @@
         da.addEventListener('change', () => {
           md.disabled = da.checked;
           if (sub) sub.classList.toggle('dim', da.checked);
+        });
+      const sh = m.querySelector('#f-seenhide'),
+        sdy = m.querySelector('#f-seendays');
+      if (sh && sdy)
+        sh.addEventListener('change', () => {
+          sdy.disabled = !sh.checked;
         });
     }
     m.querySelectorAll('.fc-tabs button').forEach((b) =>
@@ -2809,7 +2931,7 @@
           setTimeout(() => location.reload(), 700);
           return;
         }
-        return gistPullCache(); // sin recarga: traé/mezclá el caché de "agregadas recientemente"
+        return gistPullCache().then(() => gistPullSeen()); // sin recarga: traé/mezclá caché de lista + registro de vistas
       })
       .catch(() => {});
 })();
