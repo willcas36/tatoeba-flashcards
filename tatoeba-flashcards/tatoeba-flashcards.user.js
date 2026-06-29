@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.05
+// @version      5.08
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.05';
+  const SCRIPT_VERSION = '5.08';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -71,9 +71,19 @@
     pushTimer = null;
   // Cola de ESCRITURAS al gist: las corre en serie para que dos PATCH no se pisen (un gist es un repo
   // git; PATCH concurrentes -> commit con base vieja -> 409 Conflict). Todo PATCH/POST pasa por acá.
-  let gistWriteChain = Promise.resolve();
+  let gistWriteChain = Promise.resolve(),
+    lastGistWrite = 0;
+  const GIST_WRITE_GAP = 1100; // ms mínimos entre escrituras -> evita el rate limit secundario (403) de GitHub
   function gistWrite(fn) {
-    const run = gistWriteChain.then(fn, fn); // encadena aunque el anterior haya fallado
+    const run = gistWriteChain.then(async () => {
+      const wait = GIST_WRITE_GAP - (Date.now() - lastGistWrite);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait)); // espacia las escrituras
+      try {
+        return await fn();
+      } finally {
+        lastGistWrite = Date.now();
+      }
+    });
     gistWriteChain = run.catch(() => {}); // la cadena nunca queda rechazada
     return run;
   }
@@ -106,6 +116,17 @@
               return setTimeout(
                 () => ghReq(method, path, body, _try + 1).then(resolve, reject),
                 500 + _try * 500,
+              );
+            }
+            if (r.status === 403 && _try < 2) {
+              // rate limit secundario: respetá Retry-After si viene (acotado), si no backoff
+              const ra = /retry-after:\s*(\d+)/i.exec(r.responseHeaders || '');
+              const delay = ra
+                ? Math.min(parseInt(ra[1], 10) * 1000, 8000)
+                : 2000 + _try * 2000;
+              return setTimeout(
+                () => ghReq(method, path, body, _try + 1).then(resolve, reject),
+                delay,
               );
             }
             reject(new Error('GitHub ' + r.status));
@@ -212,7 +233,15 @@
   function saveListCache(obj) {
     LS.set(LIST_CACHE_KEY, JSON.stringify(obj)); // local-only: no está en SYNC_KEYS -> no auto-push de config
   }
-  // Fusiona un mapa {sid:entry} dentro del caché local de una lista (unión; gana el ts más nuevo).
+  const TOMB_KEEP_MS = 30 * 86400000; // las lápidas viven 30 días (tiempo de sobra para que todos sincronicen)
+  function pruneTombstones(byId) {
+    const cut = Date.now() - TOMB_KEEP_MS;
+    for (const k of Object.keys(byId))
+      if (byId[k] && byId[k].deleted && !(byId[k].ts >= cut)) delete byId[k];
+    return byId;
+  }
+  // Fusiona un mapa {sid:entry} dentro del caché local de una lista (UNIÓN; gana el ts más nuevo).
+  // Una "lápida" {ts,deleted:true} más nueva que una entrada la borra -> los borrados se propagan.
   function mergeListInto(merged, lid, remote) {
     const into = (merged[lid] = merged[lid] || {});
     for (const sid of Object.keys(remote || {})) {
@@ -240,12 +269,14 @@
     saveListCache(cache);
     gistPushCacheDebounced(listId);
   }
-  function cacheRemove(listId, id) {
+  function cacheRemove(listId, id, skipPush) {
     const cache = loadListCache();
-    if (cache[listId] && cache[listId][String(id)]) {
-      delete cache[listId][String(id)];
+    const byId = cache[listId];
+    const key = String(id);
+    if (byId && byId[key] && !byId[key].deleted) {
+      byId[key] = { id: id, ts: Date.now(), deleted: true }; // LÁPIDA: marca borrado (viaja con el push, no resucita)
       saveListCache(cache);
-      gistPushCacheDebounced(listId);
+      if (!skipPush) gistPushCacheDebounced(listId); // skipPush: el borrado en lote pushea UNA vez al final
     }
   }
   // Sube SOLO los archivos de las listas que cambiaron (un archivo por lista).
@@ -258,7 +289,7 @@
     for (const lid of listIds) {
       files[cacheFileName(lid)] = {
         content: JSON.stringify({
-          updated: Date.now(),
+          updated: Date.now(), // informativo (la fusión es por entrada/lápida, no por archivo)
           listId: lid,
           cache: cache[lid] || {},
         }),
@@ -299,7 +330,8 @@
         /* archivo viejo corrupto: ignorar */
       }
     }
-    // Formato nuevo: un archivo por lista.
+    // Formato nuevo: un archivo por lista. UNIÓN por entrada (gana el ts más nuevo). Las lápidas
+    // {ts,deleted} viajan en la unión -> un borrado más nuevo que una entrada la mantiene borrada.
     for (const fname of Object.keys(files)) {
       const m = fname.match(CACHE_FILE_RE);
       if (!m) continue;
@@ -307,11 +339,12 @@
       if (!f || !f.content) continue;
       try {
         const payload = JSON.parse(f.content) || {};
-        mergeListInto(merged, payload.listId || m[1], payload.cache || {});
+        mergeListInto(merged, String(payload.listId || m[1]), payload.cache || {});
       } catch (e) {
         /* archivo corrupto: seguir con los demás */
       }
     }
+    for (const lid of Object.keys(merged)) pruneTombstones(merged[lid]); // limpia lápidas viejas (>30d)
     saveListCache(merged);
   }
 
@@ -582,7 +615,7 @@
       return Object.assign({}, LIST_DISPLAY_DEFAULT);
     }
   })();
-  const saveListDisplay = () => saveActive();
+  const saveListDisplay = () => saveActiveQuiet();
   let listSort = LS.get('sm-fc-listsort') || '-created'; // orden de "Mi lista" (sort de la API)
   // Escribe el estado actual (globals) en el perfil activo y persiste el mapa de perfiles -> dispara el sync.
   function saveActive() {
@@ -591,6 +624,17 @@
     saveProfilesMap(profs);
     dirty = false;
     updateId();
+  }
+  // Igual que saveActive pero SIN push al gist: para preferencias de vista de la lista (orden/idioma),
+  // que no deben escribir a git en cada toggle. Sincronizan en el próximo Sync o guardado de config.
+  function saveActiveQuiet() {
+    const prev = suppressPush;
+    suppressPush = true;
+    try {
+      saveActive();
+    } finally {
+      suppressPush = prev;
+    }
   }
 
   const langSeg = () =>
@@ -762,7 +806,8 @@
   }
   // ids de la lista activa según el caché (lo agregado por la app), como Set de strings.
   function listExcludeSet() {
-    return new Set(Object.keys(loadListCache()[LIST_ID] || {}));
+    const byId = loadListCache()[LIST_ID] || {};
+    return new Set(Object.keys(byId).filter((k) => !byId[k].deleted)); // ignora lápidas
   }
   async function ensureBuffer(force) {
     if (!force && cards.length - 1 - index > PREFETCH_AT) return;
@@ -1725,10 +1770,11 @@
       // secuencial: más suave con el servidor que disparar N a la vez
       if (await listAction('remove_sentence_from_list', row.dataset.sid)) {
         ok++;
-        cacheRemove(LIST_ID, row.dataset.sid);
+        cacheRemove(LIST_ID, row.dataset.sid, true); // skipPush: evita la ráfaga de pushes (causaba el 403)
         row.remove();
       }
     }
+    if (ok) gistPushCacheDebounced(LIST_ID); // UN solo push al final con el estado ya borrado
     if (listTotal != null && ok) {
       listTotal = Math.max(0, listTotal - ok);
       applyListTitle();
@@ -1774,7 +1820,7 @@
     });
     wrap.querySelector('#ld-sort').addEventListener('change', (e) => {
       listSort = e.target.value;
-      saveActive(); // persiste al perfil activo (+ sincroniza)
+      saveActiveQuiet(); // guarda local SIN push (preferencia de vista); sincroniza en el próximo Sync
       listPage = 1;
       listUrls = [];
       loadListPage();
@@ -1844,11 +1890,13 @@
     // Orden por fecha de agregado (lo que registramos nosotros). Reusa buildListRow
     // porque cada entrada tiene la forma de un objeto de la API.
     const byId = loadListCache()[LIST_ID] || {};
-    const entries = Object.values(byId).sort((a, b) =>
-      listSort === '-added'
-        ? (b.ts || 0) - (a.ts || 0)
-        : (a.ts || 0) - (b.ts || 0),
-    );
+    const entries = Object.values(byId)
+      .filter((e) => !e.deleted) // ignora lápidas (borrados)
+      .sort((a, b) =>
+        listSort === '-added'
+          ? (b.ts || 0) - (a.ts || 0)
+          : (a.ts || 0) - (b.ts || 0),
+      );
     listTotal = entries.length;
     applyListTitle();
     renderListPage(area, entries, false); // sin paginación de red: todo local (tope 500)
