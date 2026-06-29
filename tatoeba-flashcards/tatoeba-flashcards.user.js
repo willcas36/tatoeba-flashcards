@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.13
+// @version      5.16
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.13';
+  const SCRIPT_VERSION = '5.16';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -1172,6 +1172,8 @@
       .fc-list-ctrls { display:flex; flex-direction:column; gap:8px; padding:4px 4px 12px; border-bottom:1px solid var(--line); margin-bottom:6px; }
       .fc-list-ctrls label { font-size:12px; color:var(--muted); display:flex; flex-direction:column; gap:3px; }
       .fc-list-ctrls select { padding:7px; border:1px solid var(--line); border-radius:6px; font-size:16px; background:var(--card); color:var(--fg); }
+      .fc-health-btn { margin-top:2px; padding:9px; border:1px solid var(--accent); border-radius:6px; background:transparent; color:var(--accent); font-size:13px; font-weight:600; cursor:pointer; }
+      .fc-health-btn:hover { background:var(--accent); color:#fff; }
       .fc-list-load { display:flex; flex-direction:column; align-items:center; gap:14px; padding:44px 0; }
       .fc-list-load .lbl { font-size:13px; color:var(--muted); animation:fc-blink 1.4s ease-in-out infinite; }
       .fc-pager { display:flex; align-items:center; justify-content:center; gap:16px; padding:14px; color:var(--muted); font-size:13px; }
@@ -1792,8 +1794,8 @@
     all.checked = sels.length > 0 && checked.length === sels.length;
     all.indeterminate = checked.length > 0 && checked.length < sels.length;
   }
-  function confirmDialog(msg, okLabel) {
-    // confirmación temática (reemplaza al confirm() nativo)
+  function confirmDialog(msg, okLabel, hideCancel) {
+    // confirmación temática (reemplaza al confirm() nativo). hideCancel -> modal informativo de un botón.
     return new Promise((resolve) => {
       let m = document.getElementById('fc-confirm');
       if (!m) {
@@ -1804,6 +1806,7 @@
       }
       m.querySelector('.cmsg').textContent = msg;
       m.querySelector('.c-ok').textContent = okLabel || 'Eliminar';
+      m.querySelector('.c-cancel').style.display = hideCancel ? 'none' : '';
       const onCancel = () => close(false),
         onOk = () => close(true);
       const onBackdrop = (e) => {
@@ -1883,7 +1886,9 @@
     wrap.innerHTML =
       `<label>Oraciones en:<select id="ld-front">${langOpts(LIST_DISPLAY.front)}</select></label>` +
       `<label>Mostrar traducciones en:<select id="ld-back">${langOpts(LIST_DISPLAY.back)}</select></label>` +
-      `<label>Ordenar por:<select id="ld-sort">${sortOpts}</select></label>`;
+      `<label>Ordenar por:<select id="ld-sort">${sortOpts}</select></label>` +
+      `<button type="button" id="ld-health" class="fc-health-btn">Verificar salud de la lista</button>`;
+    wrap.querySelector('#ld-health').addEventListener('click', listHealthCheck);
     wrap.querySelector('#ld-front').addEventListener('change', (e) => {
       LIST_DISPLAY.front = e.target.value;
       saveListDisplay();
@@ -1932,6 +1937,128 @@
     p.set('include', 'audios');
     p.set('limit', '30');
     return p.toString();
+  }
+
+  /* ===== Salud de la lista: reconciliar nuestro caché con lo que tiene Tatoeba =====
+     Límite del server (probado): SIN traducciones -> 500/página; con showtrans=all -> ~50/página.
+     Por eso comparamos solo ids (rápido, 500/pág) y traemos traducciones SOLO al sanear (50/pág). */
+  async function fetchAllListMembers(withTrans) {
+    const p = new URLSearchParams();
+    p.set('lang', LIST_LANGS);
+    p.set('list', String(LIST_ID));
+    p.set('sort', '-created'); // sort válido de la API ('-added'/'added' son del caché)
+    if (withTrans) p.set('showtrans', 'all'); // con traducciones el server topa en ~50/página
+    p.set('limit', '500'); // sin showtrans -> hasta 500; con showtrans -> ~50
+    const all = [];
+    let url = `${API_BASE}/sentences?${p.toString()}`;
+    let guard = 0;
+    while (url && guard++ < 2000) {
+      const data = await apiSearch(url);
+      for (const c of data.data || []) all.push(c);
+      url = data.paging && data.paging.has_next ? data.paging.next : null;
+    }
+    return all;
+  }
+  // Una oración con traducciones, por id (probado: /sentences/{id}?showtrans=all -> {data:{...,translations}}).
+  async function fetchSentenceById(id) {
+    const r = await apiSearch(`${API_BASE}/sentences/${id}?showtrans=all`);
+    return r && r.data ? r.data : null;
+  }
+  function cacheEntryFromMember(c, ts) {
+    return {
+      ts: ts,
+      id: c.id,
+      lang: c.lang,
+      text: c.text,
+      owner: c.owner,
+      translations: (c.translations || []).map((t) => ({
+        lang: t.lang,
+        text: t.text,
+        id: t.id,
+        owner: t.owner,
+      })),
+    };
+  }
+  async function listHealthCheck() {
+    toastLoading('Verificando salud…');
+    let ids;
+    try {
+      ids = await fetchAllListMembers(false); // FASE 1: solo ids (500/página, rápido)
+    } catch (e) {
+      toast('No se pudo leer la lista de Tatoeba', false);
+      return;
+    }
+    const T = new Set(ids.map((c) => String(c.id)));
+    const cache = loadListCache()[LIST_ID] || {};
+    const activeIds = Object.keys(cache).filter((k) => !cache[k].deleted);
+    const missingIds = [...T].filter((id) => {
+      const e = cache[id];
+      return !e || e.deleted; // en Tatoeba pero NO activa en el caché
+    });
+    const extraIds = activeIds.filter((id) => !T.has(id)); // en el caché pero NO en Tatoeba
+    toastEl && toastEl.classList.remove('show'); // cerrá el spinner antes del modal
+    if (!missingIds.length && !extraIds.length) {
+      await confirmDialog(
+        `✓ Salud correcta — tu lista coincide con Tatoeba (${T.size} oraciones).`,
+        'Listo',
+        true,
+      );
+      return;
+    }
+    const ok = await confirmDialog(
+      `Tatoeba diverge de tu caché: faltan ${missingIds.length}, sobran ${extraIds.length}. ¿Sanear? Tu lista quedará idéntica a Tatoeba.`,
+      'Sanear',
+    );
+    if (!ok) return;
+    let fullById = {};
+    if (missingIds.length) {
+      toastLoading('Saneando…');
+      try {
+        // FASE 2 (solo si hay que AGREGAR): traer los DATOS con traducciones.
+        // Híbrido: si faltan pocas, traerlas por id (1 request c/u, en tandas paralelas);
+        // si faltan muchas, traer la lista entera con traducciones (~50/página) -> menos requests.
+        const wholePages = Math.ceil(T.size / 50);
+        if (missingIds.length <= wholePages) {
+          for (let i = 0; i < missingIds.length; i += 5) {
+            const got = await Promise.all(
+              missingIds
+                .slice(i, i + 5)
+                .map((id) => fetchSentenceById(id).catch(() => null)),
+            );
+            got.forEach((c) => {
+              if (c) fullById[String(c.id)] = c;
+            });
+          }
+        } else {
+          (await fetchAllListMembers(true)).forEach(
+            (c) => (fullById[String(c.id)] = c),
+          );
+        }
+      } catch (e) {
+        toast('No se pudo traer los datos para sanear', false);
+        return;
+      }
+    }
+    reconcileList(fullById, missingIds, extraIds);
+    toastEl && toastEl.classList.remove('show');
+    toast(`Saneado ✓ (+${missingIds.length} / −${extraIds.length})`, true);
+  }
+  function reconcileList(fullById, missingIds, extraIds) {
+    const cache = loadListCache();
+    const byId = (cache[LIST_ID] = cache[LIST_ID] || {});
+    const now = Date.now();
+    for (const id of missingIds) {
+      const c = fullById[id];
+      if (c) byId[id] = cacheEntryFromMember(c, now); // agrega/restaura con datos frescos
+    }
+    for (const id of extraIds) byId[id] = { id: id, ts: now, deleted: true }; // tombstone los que sobran
+    saveListCache(cache);
+    gistPushCacheDebounced(LIST_ID); // un solo push con el estado reconciliado
+    if (listArea()) {
+      listPage = 1;
+      listUrls = [];
+      loadListPage();
+    } // re-render si la lista está abierta
   }
 
   async function loadListPage() {
