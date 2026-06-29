@@ -85,8 +85,17 @@ if [ ! -f "$FILE" ]; then
   fi
 fi
 
-# Push as the personal account (two gh accounts live on this machine).
+# Push as the personal account (two gh accounts live on this machine),
+# then restore whatever account you were on — on ANY exit (success, error, or early).
 if command -v gh >/dev/null 2>&1; then
+  PREV_GH="$(gh api user --jq .login 2>/dev/null || true)"
+  restore_gh() {
+    if [ -n "${PREV_GH:-}" ] && [ "$PREV_GH" != "willcas36" ]; then
+      gh auth switch -u "$PREV_GH" -h github.com >/dev/null 2>&1 || true
+      echo "Restored gh account -> $PREV_GH" >&2
+    fi
+  }
+  trap restore_gh EXIT
   gh auth switch -u willcas36 -h github.com >/dev/null 2>&1 || true
 fi
 
