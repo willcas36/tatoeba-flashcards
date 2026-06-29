@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.10
+// @version      5.13
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.10';
+  const SCRIPT_VERSION = '5.13';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -461,9 +461,11 @@
       bytes: byteLen(JSON.stringify({ updated: 0, seen: pruneSeen(loadSeen()) })),
     });
     const cache = loadListCache();
+    const named = myListsCache || [];
     for (const lid of Object.keys(cache)) {
+      const found = named.find((l) => String(l.id) === lid);
       out.push({
-        name: 'Lista ' + lid,
+        name: 'Lista #' + lid + (found ? ' - ' + found.name : ''), // id + nombre si lo tenemos
         bytes: byteLen(
           JSON.stringify({ updated: 0, listId: lid, cache: cache[lid] }),
         ),
@@ -474,13 +476,18 @@
   function renderStorageInfo(m) {
     const box = m && m.querySelector('#fc-storage');
     if (!box) return;
+    // Si todavía no tenemos los nombres de las listas, traelos y re-renderizá (sin bucle si falla).
+    if (!myListsCache && Object.keys(loadListCache()).length)
+      fetchMyLists().then((ls) => {
+        if (ls) renderStorageInfo(m);
+      });
     const rows = syncFileSizes();
     const over = rows.some((r) => r.bytes >= ONE_MB);
     box.innerHTML =
       rows
         .map(
           (r) =>
-            `<div class="fc-store-row"><span class="lbl">${r.name}</span><span class="fc-dot ${sizeClass(r.bytes)}"></span><b>${fmtSize(r.bytes)}</b></div>`,
+            `<div class="fc-store-row"><span class="lbl">${escHtml(r.name)}</span><span class="fc-dot ${sizeClass(r.bytes)}"></span><b>${fmtSize(r.bytes)}</b></div>`,
         )
         .join('') +
       (over
@@ -2851,8 +2858,10 @@
     const m = document.getElementById('fc-modal');
     if (!m) return;
     m.classList.add('open');
-    populateListSelect();
-    renderStorageInfo(m); // tamaños actuales de los archivos del gist (verde/amarillo/rojo)
+    // populateListSelect re-trae tus listas (nombres FRESCOS de Tatoeba); al terminar, re-renderizá
+    // el tamaño con esos nombres -> si renombraste la lista en la web, aparece sin lag.
+    Promise.resolve(populateListSelect()).then(() => renderStorageInfo(m));
+    renderStorageInfo(m); // render inmediato con lo que ya tengamos
     // Re-sincronizar los chips de Palabras con el query realmente guardado (evita que se vacíen/desincronicen).
     const box = m.querySelector('#f-query-box'),
       input = m.querySelector('#f-query-input');
