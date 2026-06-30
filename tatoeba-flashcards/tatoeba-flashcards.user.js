@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tatoeba - Flashcards (Sentence Mining)
 // @namespace    https://tatoeba.org/
-// @version      5.17
+// @version      5.20
 // @description  Flashcards tipo Anki sobre la búsqueda filtrada de Tatoeba (mobile + teclado)
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=tatoeba.org
 // @match        https://tatoeba.org/*/sentences/search*
@@ -17,7 +17,7 @@
 
 (function () {
   'use strict';
-  const SCRIPT_VERSION = '5.17';
+  const SCRIPT_VERSION = '5.20';
 
   /* ============ STORAGE (backend local: GM_setValue, con fallback a localStorage) ============ */
   // Acá NO hay sync entre dispositivos: esto es solo el guardado LOCAL. El sync cruzado lo hace el Gist (más abajo).
@@ -180,7 +180,15 @@
     if (!file || !file.content) return false;
     const payload = JSON.parse(file.content);
     const localTs = parseInt(LS.get('sm-fc-sync-ts') || '0', 10);
-    if (!(payload.updated > localTs)) return false; // nada más nuevo
+    if (!(payload.updated > localTs)) return false; // nada más nuevo (por ts)
+    // ¿El contenido remoto difiere DE VERDAD del local? Si es idéntico, solo alineá el ts y NO recargues
+    // (evita el "config más nueva — recargando" espurio cuando el ts avanzó pero nada cambió).
+    const rdata = payload.data || {};
+    const rkeys = Object.keys(rdata).filter((k) => SYNC_KEYS.includes(k));
+    if (rkeys.every((k) => String(rdata[k]) === (LS.get(k) || ''))) {
+      LS.set('sm-fc-sync-ts', String(payload.updated));
+      return false;
+    }
     // PROTECCIÓN: si hay cambios sin guardar (Aplicar/dirty), avisá antes de pisarlos con lo de la nube.
     if (dirty) {
       const ok = await confirmDialog(
@@ -706,6 +714,16 @@
       suppressPush = prev;
     }
   }
+  // Escribe una clave sincronizable SIN disparar el push (sube en el próximo Sync/Guardar).
+  function lsQuiet(k, v) {
+    const prev = suppressPush;
+    suppressPush = true;
+    try {
+      LS.set(k, v);
+    } finally {
+      suppressPush = prev;
+    }
+  }
 
   const langSeg = () =>
     (location.pathname.match(/^\/([a-z]{2,3})\//) || [, 'es'])[1];
@@ -1083,6 +1101,8 @@
         justify-content:safe center; text-align:center; padding:22px; gap:18px; overflow:hidden;
         font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
       #fc-front { font-size:31px; line-height:1.45; font-weight:700; letter-spacing:.2px; }
+      #fc-front.fc-enter { animation:fc-cardIn .26s cubic-bezier(.2,.8,.3,1) both; } /* al cambiar de oración */
+      @keyframes fc-cardIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
       #fc-back { font-size:24px; line-height:1.5; font-weight:500; color:var(--back); border-top:1px solid rgba(128,128,128,.35); padding-top:16px; }
       #fc-back.fc-reveal, #fc-owners.fc-reveal { animation:fc-revealIn .26s cubic-bezier(.2,.7,.3,1) both; }
       #fc-owners.fc-reveal { animation-delay:.07s; }
@@ -1549,6 +1569,9 @@
       b = backOf(c);
     frontEl.textContent = f.text;
     backEl.textContent = b.text;
+    frontEl.classList.remove('fc-enter'); // re-dispara la animación de entrada al cambiar de oración
+    void frontEl.offsetWidth;
+    frontEl.classList.add('fc-enter');
     // Oraciones largas -> achicar la fuente para que entren cómodas (escala suave por largo).
     frontEl.style.fontSize = fitFont(f.text, 31, 15) + 'px';
     backEl.style.fontSize = fitFont(b.text, 24, 14) + 'px';
@@ -1594,7 +1617,7 @@
     const on = !overlay.classList.contains('dark');
     overlay.classList.toggle('dark', on);
     document.documentElement.classList.toggle('fc-dark', on); // habilita el tema oscuro también en paneles/modal (cuelgan de <body>)
-    LS.set(K.dark, on ? '1' : '0');
+    lsQuiet(K.dark, on ? '1' : '0'); // local ahora; sube al próximo Guardar/Sync (igual que las prefs de lista)
     const ic = overlay.querySelector('[data-act="dark"] .material-icons');
     if (ic) ic.textContent = on ? 'wb_sunny' : 'brightness_2';
   }
@@ -2518,6 +2541,44 @@
       (parseInt(cfg.seenDays, 10) || 3) === d.seenDays
     );
   }
+  // ¿Dos configs son iguales? (sin depender del orden de claves)
+  function cfgEquals(a, b) {
+    a = a || {};
+    b = b || {};
+    return (
+      JSON.stringify(a.filters || {}) === JSON.stringify(b.filters || {}) &&
+      JSON.stringify(a.display || {}) === JSON.stringify(b.display || {}) &&
+      JSON.stringify(a.listDisplay || {}) ===
+        JSON.stringify(b.listDisplay || {}) &&
+      (a.listId || '174916') === (b.listId || '174916') &&
+      (a.audioLang || 'eng') === (b.audioLang || 'eng') &&
+      (a.listSort || '-created') === (b.listSort || '-created') &&
+      !!a.startRevealed === !!b.startRevealed &&
+      (a.hideListed !== false) === (b.hideListed !== false) &&
+      (a.seenHide !== false) === (b.seenHide !== false) &&
+      (parseInt(a.seenDays, 10) || 3) === (parseInt(b.seenDays, 10) || 3)
+    );
+  }
+  // ¿Dos mapas planos {k:v} son iguales?
+  function sameMap(a, b) {
+    a = a || {};
+    b = b || {};
+    const ka = Object.keys(a),
+      kb = Object.keys(b);
+    return ka.length === kb.length && ka.every((k) => a[k] === b[k]);
+  }
+  // ¿El estado APLICADO (globals) difiere de lo GUARDADO? -> decide si "Aplicar" marca "sin guardar".
+  function appliedDiffersFromSaved() {
+    if (!cfgEquals(snapshotFromGlobals(), loadProfiles()[activeProfile] || {}))
+      return true;
+    if (!sameMap(KEYS, loadObj('sm-fc-keys', KEYS_DEFAULT))) return true;
+    if (!sameMap(GESTURES, loadObj('sm-fc-gestures', GESTURES_DEFAULT)))
+      return true;
+    if (DESKTOP_AUTO !== (LS.get('sm-fc-desktop-auto') !== '0')) return true;
+    if (!DESKTOP_AUTO && DESKTOP_MODE !== (LS.get('sm-fc-desktop') === '1'))
+      return true;
+    return false;
+  }
   // Habilita/inhabilita visualmente el botón Restaurar según si el form difiere de los defaults.
   function updateRestoreBtn(m) {
     const btn = m.querySelector('#prof-restore');
@@ -2533,7 +2594,7 @@
   }
   function setActiveProfile(name) {
     activeProfile = name;
-    LS.set('sm-fc-active', name);
+    lsQuiet('sm-fc-active', name); // cambiar de perfil NO sube al gist; sincroniza en el próximo Guardar/Sync
     dirty = false;
     updateId();
   }
@@ -2790,7 +2851,6 @@
       listUrls = [];
       resetDeck();
       populateModal(m); // actualiza campos EN SU LUGAR (sin pop) -> el botón restaurar anima colapso/expansión
-      toast(`Perfil "${name}" cargado`, true);
     });
     m.querySelector('#prof-new').addEventListener('click', async () => {
       const name = await promptDialog('Nuevo perfil', 'nombre del perfil…', '');
@@ -2973,8 +3033,8 @@
       applyConfig(snapshotFromModal(m)); // solo globals (working copy)
       applyDesktopPref(m, false); // modo ordenador: aplicar EN VIVO para probar, sin persistir
       applyControls(m, false); // controles: aplicar EN VIVO para probar, sin persistir ni sincronizar
-      dirty = true;
-      updateId(); // marca "• sin guardar"
+      dirty = appliedDiffersFromSaved(); // "sin guardar" SOLO si de verdad cambió algo
+      updateId();
       closePanels();
       listUrls = [];
       closeModal();
@@ -3059,6 +3119,12 @@
     LS.set(K.open, v ? '1' : '0');
     overlay.classList.toggle('hidden', !v);
     launcher.classList.toggle('show', !v);
+    if (!v) {
+      // Los paneles y el modal cuelgan de <body>, NO de la overlay -> cerralos a mano al salir.
+      closePanels();
+      const md = document.getElementById('fc-modal');
+      if (md) md.classList.remove('open');
+    }
   }
 
   /* ============ GESTOS ============ */
